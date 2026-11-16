@@ -1,0 +1,8 @@
+version: 0.2
+
+phases:
+  build:
+    commands:
+      - echo "Deploying front-end to S3 bucket B1"
+      - aws s3 sync front-end/ s3://khushi-photos-frontend-b1/ --exclude ".gitkeep"
+      - echo "Front-end deployment complete"

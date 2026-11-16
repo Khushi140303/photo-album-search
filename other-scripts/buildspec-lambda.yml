@@ -1,0 +1,14 @@
+version: 0.2
+
+phases:
+  build:
+    commands:
+      - echo "Packaging index-photos (LF1)"
+      - cd lambda-functions/index-photos && zip -r ../../index-photos.zip . -x ".gitkeep" && cd ../..
+      - echo "Packaging search-photos (LF2)"
+      - cd lambda-functions/search-photos && zip -r ../../search-photos.zip . -x ".gitkeep" && cd ../..
+      - echo "Deploying LF1"
+      - aws lambda update-function-code --function-name index-photos --zip-file fileb://index-photos.zip
+      - echo "Deploying LF2"
+      - aws lambda update-function-code --function-name search-photos --zip-file fileb://search-photos.zip
+      - echo "Lambda deployment complete"
