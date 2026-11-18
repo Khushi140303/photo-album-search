@@ -111,6 +111,7 @@ def search_opensearch(keywords):
 
 
 def lambda_handler(event, context):
+    print("search-photos v2 - deployed via CodePipeline")
     print("Received event:", json.dumps(event))
     query = get_query(event)
     if not query:
