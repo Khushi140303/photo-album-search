@@ -1,0 +1,366 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: T1 - Photo Album (2 Lambdas, API Gateway, 2 S3 buckets)
+
+Parameters:
+  OpenSearchEndpoint:
+    Type: String
+    Default: https://search-photos-uxumrbuy6k3buecsyqaarwgzrm.us-east-1.es.amazonaws.com
+  OpenSearchUser:
+    Type: String
+    Default: admin
+  OpenSearchPassword:
+    Type: String
+    NoEcho: true
+  LexBotId:
+    Type: String
+    Default: DMXYKBVDXJ
+  LexBotAliasId:
+    Type: String
+    Default: TSTALIASID
+
+Resources:
+  # ---------- S3 ----------
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-frontend-${AWS::AccountId}"
+      WebsiteConfiguration:
+        IndexDocument: index.html
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action: s3:GetObject
+            Resource: !Sub "arn:aws:s3:::${FrontendBucket}/*"
+
+  PhotosBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: IndexPhotosS3Permission
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-photos-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ["*"]
+            AllowedMethods: [GET, PUT, HEAD]
+            AllowedOrigins: ["*"]
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:Put
+            Function: !GetAtt IndexPhotosFunction.Arn
+
+  PhotosBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref PhotosBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action: s3:GetObject
+            Resource: !Sub "arn:aws:s3:::${PhotosBucket}/*"
+
+  # ---------- IAM ----------
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonRekognitionReadOnlyAccess
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+        - arn:aws:iam::aws:policy/AmazonLexRunBotsOnly
+
+  ApiS3Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: apigateway.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: s3-put-photos
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "arn:aws:s3:::${AWS::StackName}-photos-${AWS::AccountId}/*"
+
+  # ---------- Lambda ----------
+  IndexPhotosFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-index-photos"
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Timeout: 30
+      Role: !GetAtt LambdaRole.Arn
+      Environment:
+        Variables:
+          OS_ENDPOINT: !Ref OpenSearchEndpoint
+          OS_USER: !Ref OpenSearchUser
+          OS_PASS: !Ref OpenSearchPassword
+      Code:
+        ZipFile: |
+          import json, os, urllib.parse, boto3, urllib3
+          s3 = boto3.client("s3"); rek = boto3.client("rekognition"); http = urllib3.PoolManager()
+          E = os.environ
+          def lambda_handler(event, context):
+              for r in event["Records"]:
+                  b = r["s3"]["bucket"]["name"]; k = urllib.parse.unquote_plus(r["s3"]["object"]["key"])
+                  labels = [l["Name"].lower() for l in rek.detect_labels(Image={"S3Object": {"Bucket": b, "Name": k}}, MaxLabels=20, MinConfidence=70)["Labels"]]
+                  head = s3.head_object(Bucket=b, Key=k)
+                  custom = [c.strip().lower() for c in head.get("Metadata", {}).get("customlabels", "").split(",") if c.strip()]
+                  doc = {"objectKey": k, "bucket": b, "createdTimestamp": head["LastModified"].strftime("%Y-%m-%dT%H:%M:%S"), "labels": list(dict.fromkeys(custom + labels))}
+                  h = urllib3.make_headers(basic_auth=E["OS_USER"] + ":" + E["OS_PASS"]); h["Content-Type"] = "application/json"
+                  res = http.request("PUT", E["OS_ENDPOINT"].rstrip("/") + "/photos/_doc/" + urllib.parse.quote(k, safe=""), body=json.dumps(doc), headers=h)
+                  print("Indexed", k, res.status, doc["labels"])
+              return {"statusCode": 200}
+
+  IndexPhotosS3Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref IndexPhotosFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub "arn:aws:s3:::${AWS::StackName}-photos-${AWS::AccountId}"
+
+  SearchPhotosFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-search-photos"
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Timeout: 30
+      Role: !GetAtt LambdaRole.Arn
+      Environment:
+        Variables:
+          OS_ENDPOINT: !Ref OpenSearchEndpoint
+          OS_USER: !Ref OpenSearchUser
+          OS_PASS: !Ref OpenSearchPassword
+          BOT_ID: !Ref LexBotId
+          BOT_ALIAS_ID: !Ref LexBotAliasId
+      Code:
+        ZipFile: |
+          import json, os, uuid, urllib.parse, boto3, urllib3
+          lex = boto3.client("lexv2-runtime"); http = urllib3.PoolManager()
+          E = os.environ
+          H = {"Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "*", "Access-Control-Allow-Methods": "GET,PUT,OPTIONS"}
+          def resp(r): return {"statusCode": 200, "headers": H, "body": json.dumps({"results": r})}
+          def sing(w):
+              w = w.lower().strip(); f = {w}
+              if len(w) > 3:
+                  if w.endswith("ies"): f.add(w[:-3] + "y")
+                  elif w.endswith(("ches", "shes", "xes", "ses", "zes")): f.add(w[:-2])
+                  elif w.endswith("s") and not w.endswith("ss"): f.add(w[:-1])
+              return f
+          def lambda_handler(event, context):
+              q = ((event.get("queryStringParameters") or {}).get("q") or "").strip()
+              if not q: return resp([])
+              r = lex.recognize_text(botId=E["BOT_ID"], botAliasId=E["BOT_ALIAS_ID"], localeId="en_US", sessionId=str(uuid.uuid4()), text=q)
+              i = r.get("sessionState", {}).get("intent", {})
+              if i.get("name") != "SearchIntent": return resp([])
+              terms = set()
+              for s in (i.get("slots") or {}).values():
+                  if s and s.get("value"): terms |= sing(s["value"].get("interpretedValue") or s["value"]["originalValue"])
+              if not terms: return resp([])
+              body = {"size": 100, "query": {"bool": {"should": [{"match": {"labels": t}} for t in terms], "minimum_should_match": 1}}}
+              h = urllib3.make_headers(basic_auth=E["OS_USER"] + ":" + E["OS_PASS"]); h["Content-Type"] = "application/json"
+              d = json.loads(http.request("GET", E["OS_ENDPOINT"].rstrip("/") + "/photos/_search", body=json.dumps(body), headers=h).data)
+              out = []
+              for x in d.get("hits", {}).get("hits", []):
+                  s = x["_source"]
+                  out.append({"url": "https://" + s["bucket"] + ".s3.amazonaws.com/" + urllib.parse.quote(s["objectKey"]), "labels": s.get("labels", [])})
+              return resp(out)
+
+  SearchApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SearchPhotosFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PhotoApi}/*/GET/search"
+
+  # ---------- API Gateway ----------
+  PhotoApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${AWS::StackName}-api"
+      BinaryMediaTypes: ["image/jpeg", "image/png", "image/*"]
+      EndpointConfiguration:
+        Types: [REGIONAL]
+
+  SearchResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PhotoApi
+      ParentId: !GetAtt PhotoApi.RootResourceId
+      PathPart: search
+
+  SearchGet:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PhotoApi
+      ResourceId: !Ref SearchResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      RequestParameters:
+        method.request.querystring.q: false
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SearchPhotosFunction.Arn}/invocations"
+
+  SearchOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PhotoApi
+      ResourceId: !Ref SearchResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates: { application/json: '{"statusCode": 200}' }
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Api-Key'"
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Headers: true
+
+  PhotosResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PhotoApi
+      ParentId: !GetAtt PhotoApi.RootResourceId
+      PathPart: photos
+
+  ObjectResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PhotoApi
+      ParentId: !Ref PhotosResource
+      PathPart: "{object}"
+
+  PhotosPut:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PhotoApi
+      ResourceId: !Ref ObjectResource
+      HttpMethod: PUT
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      RequestParameters:
+        method.request.path.object: true
+        method.request.header.x-amz-meta-customLabels: false
+        method.request.header.Content-Type: false
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: PUT
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:s3:path/${PhotosBucket}/{object}"
+        Credentials: !GetAtt ApiS3Role.Arn
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestParameters:
+          integration.request.path.object: method.request.path.object
+          integration.request.header.x-amz-meta-customLabels: method.request.header.x-amz-meta-customLabels
+          integration.request.header.Content-Type: method.request.header.Content-Type
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+
+  ObjectOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PhotoApi
+      ResourceId: !Ref ObjectResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates: { application/json: '{"statusCode": 200}' }
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Methods: "'PUT,OPTIONS'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Api-Key,x-amz-meta-customLabels'"
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Headers: true
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: [SearchGet, SearchOptions, PhotosPut, ObjectOptions]
+    Properties:
+      RestApiId: !Ref PhotoApi
+      StageName: prod
+
+  ApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    DependsOn: ApiDeployment
+    Properties:
+      Name: !Sub "${AWS::StackName}-key"
+      Enabled: true
+
+  UsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: ApiDeployment
+    Properties:
+      UsagePlanName: !Sub "${AWS::StackName}-plan"
+      ApiStages:
+        - ApiId: !Ref PhotoApi
+          Stage: prod
+
+  UsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref ApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref UsagePlan
+
+Outputs:
+  WebsiteURL:
+    Description: Public URL of the frontend bucket (B1)
+    Value: !GetAtt FrontendBucket.WebsiteURL
+  ApiInvokeURL:
+    Value: !Sub "https://${PhotoApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+  PhotosBucketName:
+    Value: !Ref PhotosBucket
+  ApiKeyId:
+    Description: Look up the key value in API Gateway > API keys
+    Value: !Ref ApiKey
